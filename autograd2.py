@@ -47,6 +47,27 @@ def fast_backward(root):
             if not child.sources:
                 todo.append(child)
 
+
+def backward_kuhn(self, v=np.array([[1]])):
+    self.grad = v
+    sources = {}
+    def walk(node, source):
+        if node not in sources:
+            sources[node] = 0
+            for child in node.children:
+                walk(child, node)
+        sources[node] += 1
+    walk(self, None)
+    todo = [self]
+    while todo:
+        node = todo.pop()
+        node.push_grad(node.grad)
+        for child in node.children:
+            sources[child] -= 1
+            if not sources[child]:
+                todo.append(child)
+
+
 def test_fast():
     x = Param(3)
     y = x * x # x^2

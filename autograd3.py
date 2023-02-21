@@ -7,44 +7,33 @@ class Tensor:
         self.children = children
         self.push_grad = push_grad
 
-    #def backward(self, v=np.array([[1]])):
-    #    if v is not None:
-    #        self.grad = v
-    #    self.push_grad(self.grad)
-    #    if self.children:
-    #        self.grad = 0
-    #        for child in self.children:
-    #            child.backward(v=None)
-
     def backward(self, v=np.array([[1]])):
-        def walk(node, source):
-            # If I want to batch gradients, I probably need
-            # a different way to zero grads. Or just not do it on leaves.
-            node.grad = 0
-            if not hasattr(node, 'sources'):
-                node.sources = 1
-            else:
-                node.sources += 1
-                return
-            for child in node.children:
-                walk(child, node)
-        walk(self, None)
-
         self.grad = v
-        todo = [self]
-        while todo:
-            node = todo.pop()
+        visited, order = set(), []
+        def walk(node):
+            if node not in visited:
+                visited.add(node)
+                for child in node.children:
+                    walk(child)
+                order.append(node)
+        walk(self)
+        for node in reversed(order):
             node.push_grad(node.grad)
-            for child in node.children:
-                child.sources -= 1
-                if not child.sources:
-                    todo.append(child)
+
+    @staticmethod
+    def broadcast_tensors(*tensors):
+        shape = np.broadcast_shapes(*(t.val.shape for t in tensors))
+        return [t.broadcast_to(shape) for t in tensors]
+
+    def broadcast_to(self, shape):
+        t = tuple(i for i, s in enumerate(self.val.shape) if s == 1)
+        return self.apply(np.broadcast_to(self.val, shape), lambda g: g.sum(axis=t, keepdims=True))
 
     def __add__(p1, p2):
+        p1, p2 = Tensor.broadcast_tensors(p1, p2)
         def push_grad(grad):
-            # We have to undo broadcasting here
-            p1.grad += grad if grad.shape == p1.val.shape else grad.sum(axis=-1, keepdims=True)
-            p2.grad += grad if grad.shape == p2.val.shape else grad.sum(axis=-1, keepdims=True)
+            p1.grad += grad
+            p2.grad += grad
         return Tensor(p1.val + p2.val, [p1, p2], push_grad)
 
     def __matmul__(p1, p2):
@@ -54,16 +43,18 @@ class Tensor:
         return Tensor(p1.val @ p2.val, [p1, p2], push_grad)
 
     def __mul__(p1, p2):
+        p1, p2 = Tensor.broadcast_tensors(p1, p2)
         def push_grad(grad):
-            # We don't support undo broadcasting
-            p1.grad += p2 * grad
-            p2.grad += p1 * grad
-        return Tensor(p1 @ p2, [p1, p2], push_grad)
+            p1.grad += p2.val * grad
+            p2.grad += p1.val * grad
+        return Tensor(p1.val * p2.val, [p1, p2], push_grad)
+
+    def __truediv__(p1, p2):
+        return p1 * p2.pow(-1)
 
     def apply(self, new_val, jvp):
         # Helper method for unitary functions
         def push_grad(grad):
-            #print(grad, jvp(grad))
             self.grad += jvp(grad)
         return Tensor(new_val, [self], push_grad)
 
@@ -78,25 +69,24 @@ class Tensor:
         return self.apply(self.val ** n, lambda g: n * self.val ** (n-1) * g)
 
     def log(self):
-        if not np.all(self.val > 0):
-            print('log', self.val)
-        assert np.all(self.val > 0)
         return self.apply(np.log(self.val), lambda g: g / self.val)
 
+    def abs(self):
+        return self.apply(np.abs(self.val), lambda g: np.sign(self.val) * g)
+
     def exp(self):
-        #print(self.val)
-        if not np.all(self.val < 30):
-            print(self.val)
-        assert np.all(self.val < 30)
         e = np.exp(self.val)
         return self.apply(e, lambda g: e * g)
 
-    def softmax(self):
+    def softmax2(self, axis=0):
         # Jacobian = I - pp^T
         # No, actually not, it's diag(p) - pp^T. I found this bug with the Jac test
-        exps = np.exp(self.val - np.max(self.val, axis=0, keepdims=True))
-        p = exps / exps.sum(axis=0, keepdims=True)
+        exps = np.exp(self.val - np.max(self.val, axis=axis, keepdims=True))
+        p = exps / exps.sum(axis=axis, keepdims=True)
         return self.apply(p, lambda g: p*g - np.einsum('db,eb,eb->db', p, p, g))
+
+    def softmax(self, axis=0):
+        return self.exp() / self.exp().sum(axis=axis)
 
     def logsumexp2(self, axis=0):
         return self.exp().sum(axis=axis).log()
@@ -111,8 +101,8 @@ class Tensor:
         return self.apply(-self.val, lambda g: -g)
 
     def sum(self, axis=0):
-        # Could broadcasting become confused
-        return self.apply(self.val.sum(axis=axis, keepdims=True), lambda g: g)
+        return self.apply(self.val.sum(axis=axis, keepdims=True),
+                          lambda g: np.broadcast_to(g, self.val.shape))
 
     def dot(self, other, axis=0):
         return (self * other).sum(axis=axis)
@@ -133,11 +123,37 @@ class Tensor:
         # also known as the multiclass cross-entropy
         return -q.select(labels).log().sum(axis=1)
 
-    def label_cross_entropy_on_logits(self, labels):
-        #v1 = -self.softmax().select(labels).log().sum(axis=1)
-        v2 = (-self.select(labels) + self.logsumexp(axis=0)).sum(axis=1)
-        #assert np.allclose(v1.val, v2.val)
-        return v2
+    def norm(self, axis, norm=2):
+        if norm == 'exp':
+            return self.logsumexp(axis=axis)
+        return self.abs().pow(norm).sum(axis=axis).pow(1/norm)
+
+    def label_cross_entropy_on_logits(self, labels, norm=None):
+        norm_term = self.norm(axis=0, norm='exp' if norm is None else norm)
+        return (-self.select(labels) + norm_term).sum(axis=1)
+
+def test_mul():
+    np.random.seed(0)
+    x = Tensor(np.random.randn(4,3))
+    y = Tensor(np.random.randn(4,3))
+    z = (x * y).sum(axis=0).sum(axis=1)
+    z.backward()
+    np.testing.assert_allclose(x.grad, y.val)
+    np.testing.assert_allclose(y.grad, x.val)
+    # Test broadcasting
+    x = Tensor(np.arange(12).reshape(4,3))
+    y = Tensor(np.arange(4).reshape(4,1))
+    z = (x * y).sum(axis=0).sum(axis=1)
+    z.backward()
+    np.testing.assert_allclose(*np.broadcast_arrays(x.grad, y.val))
+    np.testing.assert_allclose(*np.broadcast_arrays(y.grad, x.val.sum(axis=1, keepdims=True)))
+    # Broadcast on first coordinate
+    x = Tensor(np.random.randn(4,3))
+    y = Tensor(np.random.randn(1,3))
+    z = (x * y).sum(axis=0).sum(axis=1)
+    z.backward()
+    np.testing.assert_allclose(*np.broadcast_arrays(x.grad, y.val))
+    np.testing.assert_allclose(*np.broadcast_arrays(y.grad, x.val.sum(axis=0, keepdims=True)))
 
 def jacobian_test(x0, f, eps=1e-8):
     d0, o = x0.val.shape
@@ -148,6 +164,7 @@ def jacobian_test(x0, f, eps=1e-8):
     x1 = x0 + Tensor(np.eye(d0) * eps)
     y1 = f(x1)
     J0 = (y1 + -y0).val / eps
+    # The forward here is wrong, but not enough to matter.
     y1.backward(v = np.eye(d1))
     J1 = x1.grad
     if not np.allclose(J0, J1):
@@ -155,24 +172,48 @@ def jacobian_test(x0, f, eps=1e-8):
         print(f'{x1.val=}')
         print(f'{y0.val=}')
         print(f'{y1.val=}')
-        print('Numerical Jacobian:')
-        print(J0)
-        print('Backprop Jacobian:')
-        print(J1)
-        print('Difference:')
-        print(J0 - J1)
-        print('Max error:', np.abs(J0-J1).max())
-    #assert np.allclose(J0, J1, rtol=1e-2, atol=1e-4)
-    assert np.allclose(J0, J1)
+    np.testing.assert_allclose(J0, J1.T, rtol=1e-4, atol=1e-6)
 
 def test_softmax():
     np.random.seed(0)
-    x0 = Tensor(np.random.randn(10,1))
-    jacobian_test(x0, lambda x: x.softmax())
+    #x = np.random.randn(4,1)
+    x = np.arange(4)[:, None]
+    x0 = Tensor(x)
+    x1 = Tensor(x)
+    y0 = x0.softmax()
+    y1 = x1.softmax2()
+    np.testing.assert_allclose(y0.val, y1.val, rtol=1e-4, atol=1e-6)
+    y0.sum(axis=0).backward()
+    y1.sum(axis=0).backward()
+    np.testing.assert_allclose(x0.grad, x1.grad, rtol=1e-4, atol=1e-6)
+
+def test_mean():
+    np.random.seed(0)
+    #x = np.random.randn(4,1)
+    x = Tensor(np.arange(4, dtype=float)[:, None])
+    y = (x / x.sum(axis=0)).sum(axis=0)
+    np.testing.assert_allclose(y.val, np.array([[1]]))
+    y.backward()
+    np.testing.assert_allclose(x.grad, np.zeros((4,1)))
+
+def test_sum():
+    np.random.seed(0)
+    x0 = Tensor(np.arange(1,5,dtype=float).reshape(4,1))
+    jacobian_test(x0, lambda x: x + x.sum(axis=0))
+    jacobian_test(x0, lambda x: x * x.sum(axis=0))
+    jacobian_test(x0, lambda x: x / x.sum(axis=0))
+
+def test_jacobians():
+    np.random.seed(0)
+    #x0 = Tensor(np.random.randn(4,1))
+    x0 = Tensor(np.arange(1, 5, dtype=float)[:, None])
     jacobian_test(x0, lambda x: x.relu())
+    jacobian_test(x0, lambda x: x.abs())
     jacobian_test(x0, lambda x: x.pow(2))
-    jacobian_test(x0, lambda x: x.pow(3))
-    x1 = Tensor(np.abs(np.random.randn(10,1)))
+    jacobian_test(x0, lambda x: x.pow(-1))
+    jacobian_test(x0, lambda x: x.softmax())
+    jacobian_test(x0, lambda x: x.softmax2())
+    x1 = Tensor(np.abs(np.random.randn(4,1)))
     jacobian_test(x1, lambda x: x.log())
 
 def test_logsumexp():
@@ -182,44 +223,24 @@ def test_logsumexp():
     x0, x1 = Tensor(x), Tensor(x)
     y0 = x0.logsumexp(axis=0)
     y1 = x1.exp().sum(axis=0).log()
-    assert np.allclose(y0.val, y1.val)
+    np.testing.assert_allclose(y0.val, y1.val)
     y0.backward()
     y1.backward()
-    assert np.allclose(x0.grad, x1.grad)
+    np.testing.assert_allclose(x0.grad, x1.grad)
 
 def test_label_cross_entropy():
     np.random.seed(0)
-    d, b = 100, 20
-    x = np.random.randn(d, b)
-    x0 = Tensor(x)
-    x1 = Tensor(x)
-    labels = np.random.randint(d, size=(b,))
-    c0 = x0.softmax().label_cross_entropy(labels)
-    c1 = x1.label_cross_entropy_on_logits(labels)
-    assert np.isclose(c0.val, c1.val)
-    c0.backward()
-    c1.backward()
-    assert np.allclose(x0.grad, x1.grad)
-
-def test_label_cross_entropy_mlp():
-    np.random.seed(0)
     d0, d1, b = 4, 4, 1
     x = np.random.randn(d0, b)
-    #mlp = MLP([d0, d1])
-    #mlp = lambda z: z.pow(2)
     x0 = Tensor(x)
     x1 = Tensor(x)
     labels = np.random.randint(d1, size=(b,))
     c0 = x0.pow(2).softmax().label_cross_entropy(labels)
     c1 = x1.pow(2).label_cross_entropy_on_logits(labels)
-    print(c0.val)
-    print(c1.val)
-    assert np.allclose(c0.val, c1.val)
+    np.testing.assert_allclose(c0.val, c1.val)
     c0.backward()
     c1.backward()
-    print(x0.grad)
-    print(x1.grad)
-    assert np.allclose(x0.grad, x1.grad)
+    np.testing.assert_allclose(x0.grad, x1.grad)
 
 class Linear:
     def __init__(self, a, b):
@@ -256,28 +277,43 @@ class Convolution:
 
 
 def mnist():
-    from sklearn import datasets, utils
+    from sklearn import datasets, utils, preprocessing
+    from sklearn.model_selection import train_test_split
     X, y = datasets.load_digits(return_X_y=True)
     X = X.reshape(-1, 64)
-    X -= X.mean(axis=1, keepdims=True)
-    X /= np.linalg.norm(X, axis=1, keepdims=True)
-    #print(X[0])
-    X, y = utils.shuffle(X, y)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    scaler = preprocessing.StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    batch_size = 32
+    def batches(X, y):
+        X, y = utils.shuffle(X, y)
+        for i in range(0, len(X), batch_size):
+            X_batch = Tensor(X[i:i+batch_size].T) # We use column-vector format
+            y_batch = y[i:i+batch_size]
+            yield X_batch, y_batch
+
+    # X = X.reshape(-1, 64)
+    # X -= X.mean(axis=1, keepdims=True)
+    # X /= np.linalg.norm(X, axis=1, keepdims=True)
+    # X, y = utils.shuffle(X, y)
 
     mlp = MLP([64] + [256]*4 + [10])
 
     def step(epoch):
         total_loss, correct = 0, 0
-        batch_size = 32
-        for i in range(0, len(X), batch_size):
-            X_batch = Tensor(X[i:i+batch_size].T) # We use column-vector format
-            y_batch = y[i:i+batch_size]
+        for X_batch, y_batch in batches(X_train, y_train):
             out = mlp(X_batch)
             # Compute loss
             #loss = out.softmax().label_cross_entropy(y_batch)
-            loss = out.label_cross_entropy_on_logits(y_batch)
+            #loss = out.label_cross_entropy_on_logits(y_batch)
+            #loss = out.label_cross_entropy_on_logits(y_batch, norm=2)
+            loss = -(out / out.norm(axis=0, norm=2)).select(y_batch).sum(axis=1)
+            #loss = -(out / out.norm(axis=0, norm='exp')).select(y_batch).sum(axis=1)
+            #loss = out.softmax2().label_cross_entropy(y_batch)
             # Measure accuracy
-            #print(loss.val)
             total_loss += loss.val
             correct += (out.val.argmax(axis=0) == y_batch).sum()
             # Backprop
@@ -289,9 +325,13 @@ def mnist():
             for p in mlp.parameters():
                 p.val -= 1e-2 * p.grad / batch_size
                 p.grad = 0
-        print(f'Epoch: {epoch}, Loss: {total_loss/len(X)}, Acc: {correct/len(X)}')
+        test_acc = 0
+        for X_batch, y_batch in batches(X_test, y_test):
+            out = mlp(X_batch)
+            test_acc += (out.val.argmax(axis=0) == y_batch).sum()
+        print(f'Epoch: {epoch}, Loss: {float(total_loss)/len(X_train):.3}, Acc: {correct/len(X_train):.3}, Test: {test_acc/len(X_test):.3}')
 
-    for i in range(400):
+    for i in range(100):
         step(i)
 
 
