@@ -1,15 +1,18 @@
 import numpy as np
 import tqdm
 
+# Alternative tensor implementation that allows computing higher derivatives.
+# Slower than autograd3 though, about half as fast.
 class Tensor:
     def __init__(self, val, children=(), push_grad=lambda g:None):
         self.val = val if isinstance(val, np.ndarray) else np.array([[val]])
-        self.grad = np.zeros(self.val.shape)
+        self.grad = None
         self.children = children
         self.push_grad = push_grad
 
     def backward(self, v=np.array([[1]])):
-        self.grad = v
+        self.zero_grad()
+        self.grad = Tensor(v)
         visited, order = set(), []
         def walk(node):
             if node not in visited:
@@ -21,6 +24,16 @@ class Tensor:
         for node in reversed(order):
             node.push_grad(node.grad)
 
+    def zero_grad(self):
+        self.grad = Tensor(np.zeros(self.val.shape))
+        for child in self.children:
+            child.zero_grad()
+
+    def detach(self):
+        # Copy the value and computation to a new node,
+        # not referenced from elsewhere in the graph
+        return Tensor(self.val, self.children, self.push_grad)
+
     @staticmethod
     def broadcast_tensors(*tensors):
         shape = np.broadcast_shapes(*(t.val.shape for t in tensors))
@@ -28,7 +41,7 @@ class Tensor:
 
     def broadcast_to(self, shape):
         t = tuple(i for i, s in enumerate(self.val.shape) if s == 1)
-        return self.apply(np.broadcast_to(self.val, shape), lambda g: g.sum(axis=t, keepdims=True))
+        return self.apply(np.broadcast_to(self.val, shape), lambda g: g.sum(axis=t))
 
     def __add__(p1, p2):
         p1, p2 = Tensor.broadcast_tensors(p1, p2)
@@ -39,39 +52,48 @@ class Tensor:
 
     def __matmul__(p1, p2):
         def push_grad(grad):
-            p1.grad += grad @ p2.val.T
-            p2.grad += p1.val.T @ grad
+            p1.grad += grad @ p2.T
+            # If we wanted to compute the per-batch grad-norms, we could do this:
+            # ib,jb->ijb then take the norms of the outer products and sum to size b.
+            # In practice the norm of an outer product is just the product of the norms, so
+            # p1.gnorms += grad.pow(2).sum(axis=0) * p2.pow(2).sum(axis=0)
+            # That's cheap enough!
+            p2.grad += p1.T @ grad
         return Tensor(p1.val @ p2.val, [p1, p2], push_grad)
 
     def __mul__(p1, p2):
         p1, p2 = Tensor.broadcast_tensors(p1, p2)
         def push_grad(grad):
-            p1.grad += p2.val * grad
-            p2.grad += p1.val * grad
+            p1.grad += p2 * grad
+            p2.grad += p1 * grad
         return Tensor(p1.val * p2.val, [p1, p2], push_grad)
 
-    def apply(self, new_val, jvp):
-        # Helper method for unitary functions
+    def apply(self, new_val, vjp):
         def push_grad(grad):
-            self.grad += jvp(grad)
+            self.grad += vjp(grad)
         return Tensor(new_val, [self], push_grad)
 
     def __neg__(self): return self.apply(-self.val, lambda g: -g)
     def __truediv__(p1, p2): return p1 * p2.pow(-1)
-    def relu(self): return self.apply(np.maximum(self.val, 0), lambda g: (self.val > 0) * g)
-    def pow(self, n): return self.apply(self.val ** n, lambda g: n * self.val ** (n-1) * g)
-    def log(self): return self.apply(np.log(self.val), lambda g: g / self.val)
-    def abs(self): return self.apply(np.abs(self.val), lambda g: np.sign(self.val) * g)
-    def exp(self): return self.apply(np.exp(self.val), lambda g: np.exp(self.val) * g)
+    def relu(self): return self.apply(np.maximum(self.val, 0), lambda g: Tensor(self.val > 0) * g)
+    def pow(self, n): return self.apply(self.val ** n, lambda g: Tensor(n) * self.pow(n - 1) * g)
+    def log(self): return self.apply(np.log(self.val), lambda g: g / self)
+    def abs(self): return self.apply(np.abs(self.val), lambda g: Tensor(np.sign(self.val)) * g)
+    def exp(self): return self.apply(np.exp(self.val), lambda g: self.exp() * g)
     def logsumexp(self, axis=0): return self.exp().sum(axis=axis).log()
     def sum(self, axis=0): return self.apply(self.val.sum(axis=axis, keepdims=True), lambda g: g)
     def norm(self, axis, norm=2): return self.abs().pow(norm).sum(axis=axis).pow(1/norm)
 
+    def expand(self, labels, d):
+        o, b = self.val.shape
+        assert o == 1
+        new_val = np.zeros((d, b))
+        new_val[labels, range(b)] = self.val[0]
+        return self.apply(new_val, lambda g: g.select(labels))
+
     def select(self, labels):
         d, b = self.val.shape
-        def push_grad(grad):
-            self.grad[labels, range(b)] += grad[0]
-        return Tensor(self.val[labels, range(b)][None], [self], push_grad)
+        return self.apply(self.val[labels, range(b)][None], lambda g: g.expand(labels, d))
 
     def label_cross_entropy_on_logits(self, labels):
         return (-self.select(labels) + self.logsumexp(axis=0)).sum(axis=1)
@@ -79,38 +101,24 @@ class Tensor:
     ## Not needed
 
     @property
-    def T(self):
-        return self.apply(self.val.T, lambda g: g.T)
+    def T(self): return self.apply(self.val.T, lambda g: g.T)
+    def softmax(self, axis=0): return self.exp() / self.exp().sum(axis=axis)
+    # also known as the multiclass cross-entropy
+    def label_cross_entropy(q, labels): return -q.select(labels).log().sum(axis=1)
+    def dot(self, other, axis=0): return (self * other).sum(axis=axis)
+    # Returns -sum_i(p_i * log(q_i))
+    def cross_entropy(q, p): return -p.dot(q.log()).sum(axis=1)
 
-    def softmax(self, axis=0):
-        return self.exp() / self.exp().sum(axis=axis)
-
-    def label_cross_entropy(q, labels):
-        # also known as the multiclass cross-entropy
-        return -q.select(labels).log().sum(axis=1)
-
-    def dot(self, other, axis=0):
-        return (self * other).sum(axis=axis)
-
-    def cross_entropy(q, p):
-        # Returns -sum_i(p_i * log(q_i))
-        return -p.dot(q.log()).sum(axis=1)
-
-    def logsumexp2(self, axis=0):
-        top = np.max(self.val, axis=axis, keepdims=True)
-        exps = np.exp(self.val - top)
-        expsum = exps.sum(axis=axis, keepdims=True)
-        return self.apply(top + np.log(expsum), lambda g: (exps / expsum) * g)
-
-    def softmax2(self, axis=0):
-        # Jacobian = I - pp^T
-        # No, actually not, it's diag(p) - pp^T. I found this bug with the Jac test
-        exps = np.exp(self.val - np.max(self.val, axis=axis, keepdims=True))
-        p = exps / exps.sum(axis=axis, keepdims=True)
-        return self.apply(p, lambda g: p*g - np.einsum('db,eb,eb->db', p, p, g))
-
-
-
+def test_double_grad():
+    x0, N = 2, 5
+    x = Tensor(x0)
+    y = x.pow(N)
+    c = 1
+    for n in range(N, 0, -1):
+        y.backward()
+        c *= n
+        assert x.grad.val == c * x0 ** (n-1)
+        y = x.grad.detach() # Prevent cyclic dependencies and what not
 
 def test_mul():
     np.random.seed(0)
@@ -118,22 +126,22 @@ def test_mul():
     y = Tensor(np.random.randn(4,3))
     z = (x * y).sum(axis=0).sum(axis=1)
     z.backward()
-    np.testing.assert_allclose(x.grad, y.val)
-    np.testing.assert_allclose(y.grad, x.val)
+    np.testing.assert_allclose(x.grad.val, y.val)
+    np.testing.assert_allclose(y.grad.val, x.val)
     # Test broadcasting
     x = Tensor(np.arange(12).reshape(4,3))
     y = Tensor(np.arange(4).reshape(4,1))
     z = (x * y).sum(axis=0).sum(axis=1)
     z.backward()
-    np.testing.assert_allclose(*np.broadcast_arrays(x.grad, y.val))
-    np.testing.assert_allclose(*np.broadcast_arrays(y.grad, x.val.sum(axis=1, keepdims=True)))
+    np.testing.assert_allclose(*np.broadcast_arrays(x.grad.val, y.val))
+    np.testing.assert_allclose(*np.broadcast_arrays(y.grad.val, x.val.sum(axis=1, keepdims=True)))
     # Broadcast on first coordinate
     x = Tensor(np.random.randn(4,3))
     y = Tensor(np.random.randn(1,3))
     z = (x * y).sum(axis=0).sum(axis=1)
     z.backward()
-    np.testing.assert_allclose(*np.broadcast_arrays(x.grad, y.val))
-    np.testing.assert_allclose(*np.broadcast_arrays(y.grad, x.val.sum(axis=0, keepdims=True)))
+    np.testing.assert_allclose(*np.broadcast_arrays(x.grad.val, y.val))
+    np.testing.assert_allclose(*np.broadcast_arrays(y.grad.val, x.val.sum(axis=0, keepdims=True)))
 
 def jacobian_test(x0, f, eps=1e-8):
     d0, o = x0.val.shape
@@ -146,26 +154,13 @@ def jacobian_test(x0, f, eps=1e-8):
     J0 = (y1 + -y0).val / eps
     # The forward here is wrong, but not enough to matter.
     y1.backward(v = np.eye(d1))
-    J1 = x1.grad
+    J1 = x1.grad.val
     if not np.allclose(J0, J1):
         print(f'{x0.val=}')
         print(f'{x1.val=}')
         print(f'{y0.val=}')
         print(f'{y1.val=}')
     np.testing.assert_allclose(J0, J1.T, rtol=1e-4, atol=1e-6)
-
-def test_softmax():
-    np.random.seed(0)
-    #x = np.random.randn(4,1)
-    x = np.arange(4)[:, None]
-    x0 = Tensor(x)
-    x1 = Tensor(x)
-    y0 = x0.softmax()
-    y1 = x1.softmax2()
-    np.testing.assert_allclose(y0.val, y1.val, rtol=1e-4, atol=1e-6)
-    y0.sum(axis=0).backward()
-    y1.sum(axis=0).backward()
-    np.testing.assert_allclose(x0.grad, x1.grad, rtol=1e-4, atol=1e-6)
 
 def test_mean():
     np.random.seed(0)
@@ -174,7 +169,7 @@ def test_mean():
     y = (x / x.sum(axis=0)).sum(axis=0)
     np.testing.assert_allclose(y.val, np.array([[1]]))
     y.backward()
-    np.testing.assert_allclose(x.grad, np.zeros((4,1)))
+    np.testing.assert_allclose(x.grad.val, np.zeros((4,1)))
 
 def test_sum():
     np.random.seed(0)
@@ -192,7 +187,6 @@ def test_jacobians():
     jacobian_test(x0, lambda x: x.pow(2))
     jacobian_test(x0, lambda x: x.pow(-1))
     jacobian_test(x0, lambda x: x.softmax())
-    jacobian_test(x0, lambda x: x.softmax2())
     x1 = Tensor(np.abs(np.random.randn(4,1)))
     jacobian_test(x1, lambda x: x.log())
 
@@ -206,7 +200,7 @@ def test_logsumexp():
     np.testing.assert_allclose(y0.val, y1.val)
     y0.backward()
     y1.backward()
-    np.testing.assert_allclose(x0.grad, x1.grad)
+    np.testing.assert_allclose(x0.grad.val, x1.grad.val)
 
 def test_label_cross_entropy():
     np.random.seed(0)
@@ -220,7 +214,7 @@ def test_label_cross_entropy():
     np.testing.assert_allclose(c0.val, c1.val)
     c0.backward()
     c1.backward()
-    np.testing.assert_allclose(x0.grad, x1.grad)
+    np.testing.assert_allclose(x0.grad.val, x1.grad.val)
 
 class Linear:
     def __init__(self, a, b):
@@ -278,7 +272,7 @@ def mnist():
 
     batch_size = 32
     def batches(X, y):
-        X, y = utils.shuffle(X, y)
+        # X, y = utils.shuffle(X, y)
         for i in range(0, len(X), batch_size):
             X_batch = Tensor(X[i:i+batch_size].T) # We use column-vector format
             y_batch = y[i:i+batch_size]
@@ -305,8 +299,7 @@ def mnist():
             loss.backward()
             # Gradient descent
             for p in mlp.parameters():
-                p.val -= 1e-2 * p.grad / batch_size
-                p.grad = 0
+                p.val -= 1e-2 * p.grad.val / batch_size
         test_acc = 0
         for X_batch, y_batch in batches(X_test, y_test):
             test_acc += (mlp(X_batch).val.argmax(axis=0) == y_batch).sum()
