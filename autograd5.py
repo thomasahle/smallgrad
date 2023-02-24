@@ -1,5 +1,15 @@
 import numpy as np
 import tqdm
+import itertools
+
+from numpy.lib.stride_tricks import as_strided
+# https://jessicastringham.net/2017/12/31/stride-tricks/
+# https://agustinus.kristia.de/techblog/2016/07/16/convnet-conv-layer/
+def im2win(image, kh, kw):
+    (bs, ih, iw, c1), s = image.shape, image.strides
+    return as_strided(image,
+                      shape=(bs, ih - kh + 1, iw - kw + 1, kh, kw, c1),
+                      strides=(s[0], s[1], s[2], s[1], s[2], s[3]))
 
 class Tensor:
     def __init__(self, val, children=(), push_grad=lambda g:None):
@@ -57,36 +67,45 @@ class Tensor:
         return Tensor(new_val, [self], push_grad)
 
     def __neg__(self): return self.apply(-self.val, lambda g: -g)
+    def __sub__(p1, p2): return p1 + -p2
     def __truediv__(p1, p2): return p1 * p2.pow(-1)
     def relu(self): return self.apply(np.maximum(self.val, 0), lambda g: (self.val > 0) * g)
     def pow(self, n): return self.apply(self.val ** n, lambda g: n * self.val ** (n-1) * g)
     def log(self): return self.apply(np.log(self.val), lambda g: g / self.val)
     def abs(self): return self.apply(np.abs(self.val), lambda g: np.sign(self.val) * g)
     def exp(self): return self.apply(np.exp(self.val), lambda g: np.exp(self.val) * g)
-    def logsumexp(self, axis=0): return self.exp().sum(axis=axis).log()
-    def sum(self, axis=0): return self.apply(self.val.sum(axis=axis, keepdims=True), lambda g: g)
+    def logsumexp(self, axis): return self.exp().sum(axis=axis).log()
+    def sum(self, axis): return self.apply(self.val.sum(axis=axis, keepdims=True), lambda g: g)
     def norm(self, axis, norm=2): return self.abs().pow(norm).sum(axis=axis).pow(1/norm)
 
     def select(self, labels):
-        d, b = self.val.shape
+        bs, d = self.val.shape
         def push_grad(grad):
-            self.grad[labels, range(b)] += grad[0]
-        return Tensor(self.val[labels, range(b)][None], [self], push_grad)
+            self.grad[range(bs), labels] += grad[0]
+        return Tensor(self.val[range(bs), labels][:, None], [self], push_grad)
 
     def label_cross_entropy_on_logits(self, labels):
-        return (-self.select(labels) + self.logsumexp(axis=0)).sum(axis=1)
+        return (-self.select(labels) + self.logsumexp(axis=1)).sum(axis=0)
 
     def convolve(self, kernel):
         (kh, kw, c1, c2), (_, ih, iw, _c1) = kernel.val.shape, self.val.shape
-        assert c1 == _c1
-        cols = im2col(self.val, kh, kw)
-        new_val = (cols @ kernel.val.reshape(-1, c2)).reshape(-1, ih-kh+1, iw-kw+1, c2)
-        return self.apply(new_val, TODO)
+        assert c1 == _c1, f'image shape={self.val.shape}, kernel shape={kernel.val.shape}'
+        cols = self.im2win(kh, kw).reshape(-1, kh * kw * c1)
+        matmul = cols @ kernel.reshape(-1, c2)
+        return matmul.reshape(-1, ih-1, iw-1, c2)
 
-    def reshape(self, shape):
+    def im2win(self, kh, kw):
+        # It's arguably more elegant, at least easier, to make im2col differentiable,
+        # but it also makes it more expensive... Well, premature optimization and all that...
         def push_grad(grad):
-            ...
-        return Tensor(self.val.reshape(shape), [self], push_grad)
+            blocks = im2win(self.grad, kh, kw)
+            # It doesn't work to just say "blocks += grad", because
+            # overlapping values will disappear
+            np.add.at(blocks, (slice(None),)*4, grad)
+        return Tensor(im2win(self.val, kh, kw), [self], push_grad)
+
+    def reshape(self, *shape):
+        return self.apply(self.val.reshape(*shape), lambda g: g.reshape(*self.val.shape))
 
 
     ## Not needed
@@ -122,8 +141,37 @@ class Tensor:
         p = exps / exps.sum(axis=axis, keepdims=True)
         return self.apply(p, lambda g: p*g - np.einsum('db,eb,eb->db', p, p, g))
 
+def test_reshape():
+    x = Tensor(np.arange(16).reshape(16, 1))
+    for size in [(1, 1, 1, 16), (1, 1, 2, 8), (1, 1, 4, 4), (1, 2, 2, 4), (2, 2, 2, 2)]:
+        for perm in itertools.permutations(size):
+            np.testing.assert_allclose(x.reshape(*perm).val, x.val.reshape(perm))
+            def f(x0):
+                dim, bs = x0.val.shape
+                return x0.reshape(*perm, bs).reshape(dim, bs)
 
+def test_convolve():
+    np.random.seed(0)
+    images = Tensor(np.ones((1, 3, 3, 1)))
+    kernel = Tensor(np.ones((2, 2, 1, 1)))
+    np.testing.assert_allclose(
+            images.convolve(kernel).val[0,:,:,0],
+            np.array([[4, 4], [4, 4]]))
+    kernel2 = Tensor(np.ones((2, 2, 1, 2)))
+    np.testing.assert_allclose(
+            images.convolve(kernel2).val[0,:,:,:],
+            np.ones((2,2,2))*4)
 
+    images = Tensor(np.arange(9).reshape(1, 3, 3, 1))
+    kernel = Tensor(np.arange(4).reshape(2, 2, 1, 1))
+    np.testing.assert_allclose(
+            images.convolve(kernel).val[0,:,:,0],
+            np.array([[19, 25], [37, 43]]))
+
+    x0 = Tensor(np.arange(9).reshape(9,1))
+    jacobian_test(x0, lambda x: x.T.reshape(-1, 3, 3, 1).convolve(kernel).reshape(-1, 4).T)
+    kernel2 = Tensor(np.arange(8).reshape(2, 2, 1, 2))
+    jacobian_test(x0, lambda x: x.T.reshape(-1, 3, 3, 1).convolve(kernel2).reshape(-1, 8).T)
 
 def test_mul():
     np.random.seed(0)
@@ -148,24 +196,32 @@ def test_mul():
     np.testing.assert_allclose(*np.broadcast_arrays(x.grad, y.val))
     np.testing.assert_allclose(*np.broadcast_arrays(y.grad, x.val.sum(axis=0, keepdims=True)))
 
-def jacobian_test(x0, f, eps=1e-8):
+def numerical_jacobian(x0, f, eps=1e-4):
     d0, o = x0.val.shape
     assert o == 1
-    y0 = f(x0)
-    d1, o = y0.val.shape
-    assert o == 1
-    x1 = x0 + Tensor(np.eye(d0) * eps)
+    y0 = f(x0 - Tensor(np.eye(d0) * eps))
+    y1 = f(x0 + Tensor(np.eye(d0) * eps))
+    return (y1 - y0).val / (2 * eps)
+
+def jacobian(x0, f):
+    d0, o = x0.val.shape
+    d1, _o = f(x0).val.shape
+    assert o == _o == 1, "Can't compute Jacobians of batched input"
+    x1 = x0.broadcast_to((d0,d1))
     y1 = f(x1)
-    J0 = (y1 + -y0).val / eps
-    # The forward here is wrong, but not enough to matter.
+    d1, _ = y1.val.shape
     y1.backward(v = np.eye(d1))
-    J1 = x1.grad
+    return x1.grad.T
+
+def jacobian_test(x0, f, eps=1e-4):
+    J0 = numerical_jacobian(x0, f, eps)
+    J1 = jacobian(x0, f)
     if not np.allclose(J0, J1):
         print(f'{x0.val=}')
         print(f'{x1.val=}')
         print(f'{y0.val=}')
         print(f'{y1.val=}')
-    np.testing.assert_allclose(J0, J1.T, rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(J0, J1)
 
 def test_softmax():
     np.random.seed(0)
@@ -197,8 +253,6 @@ def test_sum():
     jacobian_test(x0, lambda x: x / x.sum(axis=0))
 
 def test_jacobians():
-    np.random.seed(0)
-    #x0 = Tensor(np.random.randn(4,1))
     x0 = Tensor(np.arange(1, 5, dtype=float)[:, None])
     jacobian_test(x0, lambda x: x.relu())
     jacobian_test(x0, lambda x: x.abs())
@@ -208,6 +262,14 @@ def test_jacobians():
     jacobian_test(x0, lambda x: x.softmax2())
     x1 = Tensor(np.abs(np.random.randn(4,1)))
     jacobian_test(x1, lambda x: x.log())
+    #jacobian_test(x1, lambda x: x.reshape(1,log())
+
+def test_rectangular_jacobians():
+    x0 = Tensor(np.arange(4).reshape(4, 1))
+    # From 4 down to 2
+    jacobian_test(x0, lambda x: x.reshape(2, 2, -1).sum(axis=0).reshape(2, -1))
+    # From 4 up to 16
+    jacobian_test(x0, lambda x: (x.reshape(4, 1, -1) + x.reshape(1, 4, -1)).reshape(16, -1))
 
 def test_logsumexp():
     np.random.seed(0)
@@ -236,192 +298,113 @@ def test_label_cross_entropy():
     np.testing.assert_allclose(x0.grad, x1.grad)
 
 class Linear:
-    def __init__(self, a, b):
-        self.M = Tensor(np.random.randn(b, a) / (a + b)**.5)
-        self.B = Tensor(np.random.randn(b, 1) / (b + 1)**.5)
+    def __init__(self, d1, d2):
+        self.M = Tensor(np.random.randn(d1, d2) / (d1 + d2)**.5)
+        self.B = Tensor(np.random.randn(1, d2) / (1 + d2)**.5)
 
     def __call__(self, x):
-        return self.M @ x + self.B
-
-class MLP:
-    def __init__(self, sizes):
-        self.layers = [Linear(a, b) for a, b in zip(sizes, sizes[1:])]
-
-    def __call__(self, x):
-        for layer in self.layers[:-1]:
-            x = layer(x).relu()
-        return self.layers[-1](x)
+        return x @ self.M + self.B
 
     def parameters(self):
-        return [l.M for l in self.layers] + [l.B for l in self.layers]
-
-from numpy.lib.stride_tricks import as_strided
-
-def im2col(image, kh, kw):
-    batch_size, ih, iw, num_channels = image.shape
-    shape = (batch_size, ih - kh + 1, iw - kw + 1, kh, kw, num_channels)
-    b_stride, h_stride, w_stride, c_stride = image.strides
-    strides = (b_stride, h_stride * stride[0], w_stride * stride[1], h_stride, w_stride, c_stride)
-    blocks = as_strided(image, shape=shape, strides=strides)
-    return blocks.reshape((-1, kernel_height * kernel_width * num_channels))
-
-
+        return [self.M, self.B]
 
 class Convolution:
     def __init__(self, h, w, c1, c2):
-        # https://jessicastringham.net/2017/12/31/stride-tricks/
-        # https://jessicastringham.net/2018/01/01/einsum/
-        # https://agustinus.kristia.de/techblog/2016/07/16/convnet-conv-layer/
-        self.h, self.w, self.c1, self.c2 = h, w, c1, c2
-        self.K = Tensor(np.random.randn(h*w*c1, c2) / (w*h*c1 + c2)**.5)
-        self.B = Tensor(np.random.randn(c2, 1) / (c2 + 1)**.5)
-
-    # Perform matrix multiplication between flattened input blocks and kernel
-    output = np.dot(, kernel_matrix)
-
-    # Reshape output to output feature map shape
-    output = output.reshape((batch_size, output_height, output_width, num_filters))
+        self.K = Tensor(np.random.randn(h, w, c1, c2) / (w * h * c1 + c2)**.5)
+        self.B = Tensor(np.random.randn(1, 1, 1, c2) / (c2 + 1)**.5)
 
     def __call__(self, x):
-        cols = im2col(x, self.h, self.w)
-        return cols @ self.M @ x + self.B
+        return x.convolve(self.K) + self.B
 
+    def parameters(self):
+        return [self.K, self.B]
+
+class Sequential:
+    def __init__(self, *layers):
+        self.layers = layers
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def parameters(self):
+        return [param for layer in self.layers for param in layer.parameters()]
+
+class ReLU:
+    def __call__(self, x):
+        return x.relu()
+
+    def parameters(self):
+        return []
+
+class Reshape:
+    def __init__(self, *shape):
+        self.shape = shape
+
+    def __call__(self, x):
+        return x.reshape(*self.shape)
+
+    def parameters(self):
+        return []
 
 def mnist():
     from sklearn import datasets, utils, preprocessing
     from sklearn.model_selection import train_test_split
     X, y = datasets.load_digits(return_X_y=True)
-    X = X.reshape(-1, 64)
+    X = X.reshape(-1, 8, 8, 1)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    #from sklearn.datasets import fetch_openml
-    #cifar10 = fetch_openml('CIFAR_10', version=1)
-    #X, y = cifar10['data'], cifar10['target']
-    #X = X.to_numpy().reshape(-1, 3*32*32)
-    #X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    # Seems we don't really need normalization
-    scaler = preprocessing.StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
 
     batch_size = 32
     def batches(X, y):
         X, y = utils.shuffle(X, y)
         for i in range(0, len(X), batch_size):
-            X_batch = Tensor(X[i:i+batch_size].T) # We use column-vector format
-            y_batch = y[i:i+batch_size]
-            yield X_batch, y_batch
+            yield Tensor(X[i:i+batch_size]), y[i:i+batch_size]
 
-    # X = X.reshape(-1, 64)
-    # X -= X.mean(axis=1, keepdims=True)
-    # X /= np.linalg.norm(X, axis=1, keepdims=True)
-    # X, y = utils.shuffle(X, y)
-
-    mlp = MLP([64] + [256]*4 + [10])
+    net = Sequential(
+            Convolution(2, 2, 1, 8), # Image down to (7, 7)
+            ReLU(),
+            Convolution(2, 2, 8, 11), # Image down to (6, 6)
+            ReLU(),
+            Convolution(2, 2, 11, 16), # Image down to (5, 5)
+            ReLU(),
+            Convolution(2, 2, 16, 25), # Image down to (4, 4)
+            ReLU(),
+            Reshape(-1, 4 * 4 * 25),
+            Linear(4 * 4 * 25, 10),
+        )
 
     def step(pb, epoch):
         total_loss, correct = 0, 0
         for X_batch, y_batch in batches(X_train, y_train):
-            out = mlp(X_batch)
+            out = net(X_batch)
             # Compute loss
-            loss = out.label_cross_entropy_on_logits(y_batch)
-            #loss = -(out / out.norm(axis=0)).select(y_batch).sum(axis=1)
-            #loss = (-Tensor(2)*out.select(y_batch) + out.pow(2).sum(axis=0)).sum(axis=1)
+            #loss = out.label_cross_entropy_on_logits(y_batch)
+            #loss = -(out / out.norm(axis=1)).select(y_batch).sum(axis=0)
+            loss = (-Tensor(2)*out.select(y_batch) + out.pow(2).sum(axis=1)).sum(axis=0)
             # Measure accuracy
             total_loss += loss.val
-            correct += (out.val.argmax(axis=0) == y_batch).sum()
+            #print(out.val.shape, out.val.arg y_batch)
+            correct += (out.val.argmax(axis=1) == y_batch).sum()
             # Backprop
             loss.backward()
             # Gradient descent
             #lr = 1e-2 if epoch < 100 else 1e-3
             lr = 1e-2
-            for p in mlp.parameters():
+            for p in net.parameters():
                 p.val -= lr * p.grad / batch_size
                 p.grad = 0
         test_acc = 0
         for X_batch, y_batch in batches(X_test, y_test):
-            test_acc += (mlp(X_batch).val.argmax(axis=0) == y_batch).sum()
+            test_acc += (net(X_batch).val.argmax(axis=1) == y_batch).sum()
         pb.set_description(
                 f'Loss: {float(total_loss)/len(X_train):.3}, '
                 f'Acc: {correct/len(X_train):.3}, '
                 f'Test: {test_acc/len(X_test):.3}')
 
-    with tqdm.tqdm(range(1000)) as pb:
+    with tqdm.tqdm(range(100)) as pb:
         for i in pb:
             step(pb, i)
-
-
-
-def moons():
-    from sklearn.datasets import make_moons, make_blobs
-    X, y = make_moons(n_samples=100, noise=0.1)
-
-    # mlp = MLP([2, 100, 100, 1])
-    mlp = MLP([2] + [16]*2 + [1])
-
-    def step(epoch):
-        total = 0
-        correct = 0
-        batch_size = 32
-        for i in range(0, len(X), batch_size):
-            X_batch = X[i:i+batch_size].T # We use column-vector format
-            y_batch = y[i:i+batch_size].reshape(1, -1)
-            out = mlp(Tensor(X_batch))
-            # Compute loss
-            diff = (out + Tensor(-y_batch))
-            sum_loss = diff @ diff.T
-            # Measure accuracy
-            total += sum_loss.val
-            correct += ((out.val > .5) == y_batch).sum()
-            # Backprop
-            sum_loss.backward()
-            # Gradient descent
-            for p in mlp.parameters():
-                p.val -= 1e-2 * p.grad / batch_size
-                p.grad = 0
-        print(f'Epoch: {epoch}, Loss: {total_loss/len(X)}, Acc: {correct/len(X)}')
-
-    import matplotlib.pyplot as plt
-    import matplotlib.animation as animation
-
-    fig = plt.figure()
-    ax1 = fig.add_subplot(1,1,1)
-    def plot(i):
-        h = 0.25
-        # Create a meshgrid of points to evaluate the function over
-        x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
-        y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
-        xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
-        Xmesh = np.c_[xx.ravel(), yy.ravel()]
-
-        # Compute function values for each point in the meshgrid
-        Z = mlp(Tensor(Xmesh.T)).val.T
-        #Z = mlp(Tensor(Xmesh.T)).val.T > .5
-        Z = Z.reshape(xx.shape)
-
-        # Plot the contour and scatter plots
-        plt.contourf(xx, yy, Z, 20, cmap=plt.cm.Spectral, alpha=0.8)
-        plt.scatter(X[:, 0], X[:, 1], c=y, s=40, cmap=plt.cm.Spectral)
-        plt.xlim(xx.min(), xx.max())
-        plt.ylim(yy.min(), yy.max())
-
-    def animate(i):
-        step(i)
-        plot(i)
-
-    #for i in range(500):
-    #    animate(i)
-        #plt.savefig(f'plots/moons_{i:03d}.png', dpi=96)
-        #plt.gca()
-
-    for i in range(500):
-        step(i)
-    plot(0)
-
-
-    #ani = animation.FuncAnimation(fig, animate, interval=1)
-    plt.show()
 
 
 

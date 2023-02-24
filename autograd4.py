@@ -29,11 +29,6 @@ class Tensor:
         for child in self.children:
             child.zero_grad()
 
-    def detach(self):
-        # Copy the value and computation to a new node,
-        # not referenced from elsewhere in the graph
-        return Tensor(self.val, self.children, self.push_grad)
-
     @staticmethod
     def broadcast_tensors(*tensors):
         shape = np.broadcast_shapes(*(t.val.shape for t in tensors))
@@ -74,6 +69,7 @@ class Tensor:
         return Tensor(new_val, [self], push_grad)
 
     def __neg__(self): return self.apply(-self.val, lambda g: -g)
+    def __sub__(p1, p2): return p1 + -p2
     def __truediv__(p1, p2): return p1 * p2.pow(-1)
     def relu(self): return self.apply(np.maximum(self.val, 0), lambda g: Tensor(self.val > 0) * g)
     def pow(self, n): return self.apply(self.val ** n, lambda g: Tensor(n) * self.pow(n - 1) * g)
@@ -118,7 +114,7 @@ def test_double_grad():
         y.backward()
         c *= n
         assert x.grad.val == c * x0 ** (n-1)
-        y = x.grad.detach() # Prevent cyclic dependencies and what not
+        y = x.grad
 
 def test_mul():
     np.random.seed(0)
@@ -143,24 +139,10 @@ def test_mul():
     np.testing.assert_allclose(*np.broadcast_arrays(x.grad.val, y.val))
     np.testing.assert_allclose(*np.broadcast_arrays(y.grad.val, x.val.sum(axis=0, keepdims=True)))
 
-def jacobian_test(x0, f, eps=1e-8):
-    d0, o = x0.val.shape
-    assert o == 1
-    y0 = f(x0)
-    d1, o = y0.val.shape
-    assert o == 1
-    x1 = x0 + Tensor(np.eye(d0) * eps)
-    y1 = f(x1)
-    J0 = (y1 + -y0).val / eps
-    # The forward here is wrong, but not enough to matter.
-    y1.backward(v = np.eye(d1))
-    J1 = x1.grad.val
-    if not np.allclose(J0, J1):
-        print(f'{x0.val=}')
-        print(f'{x1.val=}')
-        print(f'{y0.val=}')
-        print(f'{y1.val=}')
-    np.testing.assert_allclose(J0, J1.T, rtol=1e-4, atol=1e-6)
+def jacobian_test(x0, f, eps=1e-6):
+    J0 = numerical_jacobian(x0, f, eps)
+    J1 = jacobian(x0, f).val
+    np.testing.assert_allclose(J0, J1)
 
 def test_mean():
     np.random.seed(0)
@@ -216,6 +198,51 @@ def test_label_cross_entropy():
     c1.backward()
     np.testing.assert_allclose(x0.grad.val, x1.grad.val)
 
+def jacobian(x, f):
+    d0, o = x.val.shape
+    assert o == 1, "Can't compute Jacobians of batched input"
+    x1 = x.broadcast_to((d0,d0))
+    y1 = f(x1)
+    d1, _ = y1.val.shape
+    y1.backward(v = np.eye(d1))
+    return x1.grad.T
+
+def numerical_jacobian(x, f, eps=1e-4):
+    d0, o = x.val.shape
+    assert o == 1, "Can't compute batch Jacobians, sorry"
+    y0 = f(x - Tensor(np.eye(d0) * eps)).val
+    y1 = f(x + Tensor(np.eye(d0) * eps)).val
+    return (y1 - y0) / (2 * eps)
+
+def hessian(x, f):
+    d0, o = x.val.shape
+    assert o == 1
+    xb = x.broadcast_to((d0, d0))
+    y = f(xb)
+    assert y.val.shape == (1, d0)
+    y.backward()
+    g = xb.grad
+    g.backward(v=np.eye(d0))
+    return xb.grad
+
+def numerical_hessian(x, f, eps=1e-4):
+    d0, o = x.val.shape
+    assert o == 1
+    H = np.zeros((d0, d0))
+    for i, v in enumerate(eps * np.eye(d0)):
+        e = Tensor(v[:, None])
+        g0 = numerical_jacobian(x - e, f, eps=eps)
+        g1 = numerical_jacobian(x + e, f, eps=eps)
+        H[i, :] = (g1 - g0).flatten() / (2 * eps)
+    return H
+
+def test_hessian():
+    x = Tensor(np.array([1.,2.,3.])[:, None])
+    f = lambda x: x.softmax().dot(Tensor(np.array([1.,2.,3.])[:, None]))
+    H = hessian(x, f)
+    H1 = numerical_hessian(x, f)
+    np.testing.assert_allclose(H.val, H1, rtol=1e-6, atol=1e-8)
+
 class Linear:
     def __init__(self, a, b):
         self.M = Tensor(np.random.randn(b, a) / (a + b)**.5)
@@ -237,20 +264,6 @@ class MLP:
 
     def parameters(self):
         return [l.M for l in self.layers] + [l.B for l in self.layers]
-
-from numpy.lib.stride_tricks import as_strided
-
-class Convolution:
-    def __init__(self, w, h, c1, c2):
-        # https://jessicastringham.net/2017/12/31/stride-tricks/
-        # https://jessicastringham.net/2018/01/01/einsum/
-        self.K = Tensor(np.random.randn(w*h*c1, c2) / (w*h*c1 + c2)**.5)
-        self.M = Tensor(np.random.randn(b, a) / (a + b)**.5)
-        self.B = Tensor(np.random.randn(b, 1) / (b + 1)**.5)
-
-    def __call__(self, x):
-        return self.M @ x + self.B
-
 
 def mnist():
     from sklearn import datasets, utils, preprocessing
@@ -311,79 +324,6 @@ def mnist():
     with tqdm.tqdm(range(100)) as pb:
         for i in pb:
             step(pb, i)
-
-
-
-def moons():
-    from sklearn.datasets import make_moons, make_blobs
-    X, y = make_moons(n_samples=100, noise=0.1)
-
-    # mlp = MLP([2, 100, 100, 1])
-    mlp = MLP([2] + [16]*2 + [1])
-
-    def step(epoch):
-        total = 0
-        correct = 0
-        batch_size = 32
-        for i in range(0, len(X), batch_size):
-            X_batch = X[i:i+batch_size].T # We use column-vector format
-            y_batch = y[i:i+batch_size].reshape(1, -1)
-            out = mlp(Tensor(X_batch))
-            # Compute loss
-            diff = (out + Tensor(-y_batch))
-            sum_loss = diff @ diff.T
-            # Measure accuracy
-            total += sum_loss.val
-            correct += ((out.val > .5) == y_batch).sum()
-            # Backprop
-            sum_loss.backward()
-            # Gradient descent
-            for p in mlp.parameters():
-                p.val -= 1e-2 * p.grad / batch_size
-                p.grad = 0
-        print(f'Epoch: {epoch}, Loss: {total_loss/len(X)}, Acc: {correct/len(X)}')
-
-    import matplotlib.pyplot as plt
-    import matplotlib.animation as animation
-
-    fig = plt.figure()
-    ax1 = fig.add_subplot(1,1,1)
-    def plot(i):
-        h = 0.25
-        # Create a meshgrid of points to evaluate the function over
-        x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
-        y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
-        xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
-        Xmesh = np.c_[xx.ravel(), yy.ravel()]
-
-        # Compute function values for each point in the meshgrid
-        Z = mlp(Tensor(Xmesh.T)).val.T
-        #Z = mlp(Tensor(Xmesh.T)).val.T > .5
-        Z = Z.reshape(xx.shape)
-
-        # Plot the contour and scatter plots
-        plt.contourf(xx, yy, Z, 20, cmap=plt.cm.Spectral, alpha=0.8)
-        plt.scatter(X[:, 0], X[:, 1], c=y, s=40, cmap=plt.cm.Spectral)
-        plt.xlim(xx.min(), xx.max())
-        plt.ylim(yy.min(), yy.max())
-
-    def animate(i):
-        step(i)
-        plot(i)
-
-    #for i in range(500):
-    #    animate(i)
-        #plt.savefig(f'plots/moons_{i:03d}.png', dpi=96)
-        #plt.gca()
-
-    for i in range(500):
-        step(i)
-    plot(0)
-
-
-    #ani = animation.FuncAnimation(fig, animate, interval=1)
-    plt.show()
-
 
 
 
