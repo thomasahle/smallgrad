@@ -6,10 +6,10 @@ from numpy.lib.stride_tricks import as_strided
 # https://jessicastringham.net/2017/12/31/stride-tricks/
 # https://agustinus.kristia.de/techblog/2016/07/16/convnet-conv-layer/
 def im2win(image, kh, kw):
-    (bs, ih, iw, c1), s = image.shape, image.strides
+    (bs, c, ih, iw), s = image.shape, image.strides
     return as_strided(image,
-                      shape=(bs, ih - kh + 1, iw - kw + 1, kh, kw, c1),
-                      strides=(s[0], s[1], s[2], s[1], s[2], s[3]))
+                      shape=(bs, c, ih - kh + 1, iw - kw + 1, kh, kw),
+                      strides=(s[0], s[1]) + (s[2], s[3]) * 2)
 
 class Tensor:
     def __init__(self, val, children=(), push_grad=lambda g:None):
@@ -60,6 +60,15 @@ class Tensor:
             p2.grad += p1.val * grad
         return Tensor(p1.val * p2.val, [p1, p2], push_grad)
 
+    def select(self, labels):
+        bs, d = self.val.shape
+        def push_grad(grad):
+            self.grad[range(bs), labels] += grad[0]
+        return Tensor(self.val[range(bs), labels][:, None], [self], push_grad)
+
+    def label_cross_entropy_on_logits(self, labels):
+        return (-self.select(labels) + self.logsumexp(axis=1)).sum(axis=0)
+
     def apply(self, new_val, jvp):
         # Helper method for unitary functions
         def push_grad(grad):
@@ -78,25 +87,14 @@ class Tensor:
     def sum(self, axis): return self.apply(self.val.sum(axis=axis, keepdims=True), lambda g: g)
     def norm(self, axis, norm=2): return self.abs().pow(norm).sum(axis=axis).pow(1/norm)
 
-    def select(self, labels):
-        bs, d = self.val.shape
-        def push_grad(grad):
-            self.grad[range(bs), labels] += grad[0]
-        return Tensor(self.val[range(bs), labels][:, None], [self], push_grad)
-
-    def label_cross_entropy_on_logits(self, labels):
-        return (-self.select(labels) + self.logsumexp(axis=1)).sum(axis=0)
-
     def convolve(self, kernel):
-        (kh, kw, c1, c2), (_, ih, iw, _c1) = kernel.val.shape, self.val.shape
+        (kh, kw, c1, c2), (_, _c1, ih, iw) = kernel.val.shape, self.val.shape
         assert c1 == _c1, f'image shape={self.val.shape}, kernel shape={kernel.val.shape}'
-        cols = self.im2win(kh, kw).reshape(-1, kh * kw * c1)
+        cols = self.im2win(kh, kw).reshape(-1, c1 * kh * kw)
         matmul = cols @ kernel.reshape(-1, c2)
-        return matmul.reshape(-1, ih-1, iw-1, c2)
+        return matmul.reshape(-1, c2, ih-1, iw-1)
 
     def im2win(self, kh, kw):
-        # It's arguably more elegant, at least easier, to make im2col differentiable,
-        # but it also makes it more expensive... Well, premature optimization and all that...
         def push_grad(grad):
             blocks = im2win(self.grad, kh, kw)
             # It doesn't work to just say "blocks += grad", because
@@ -114,14 +112,14 @@ class Tensor:
     def T(self):
         return self.apply(self.val.T, lambda g: g.T)
 
-    def softmax(self, axis=0):
+    def softmax(self, axis):
         return self.exp() / self.exp().sum(axis=axis)
 
     def label_cross_entropy(q, labels):
         # also known as the multiclass cross-entropy
         return -q.select(labels).log().sum(axis=1)
 
-    def dot(self, other, axis=0):
+    def dot(self, other, axis):
         return (self * other).sum(axis=axis)
 
     def cross_entropy(q, p):
@@ -134,7 +132,7 @@ class Tensor:
         expsum = exps.sum(axis=axis, keepdims=True)
         return self.apply(top + np.log(expsum), lambda g: (exps / expsum) * g)
 
-    def softmax2(self, axis=0):
+    def softmax2(self, axis):
         # Jacobian = I - pp^T
         # No, actually not, it's diag(p) - pp^T. I found this bug with the Jac test
         exps = np.exp(self.val - np.max(self.val, axis=axis, keepdims=True))
@@ -152,7 +150,7 @@ def test_reshape():
 
 def test_convolve():
     np.random.seed(0)
-    images = Tensor(np.ones((1, 3, 3, 1)))
+    images = Tensor(np.ones((1, 1, 3, 3)))
     kernel = Tensor(np.ones((2, 2, 1, 1)))
     np.testing.assert_allclose(
             images.convolve(kernel).val[0,:,:,0],
@@ -162,16 +160,16 @@ def test_convolve():
             images.convolve(kernel2).val[0,:,:,:],
             np.ones((2,2,2))*4)
 
-    images = Tensor(np.arange(9).reshape(1, 3, 3, 1))
+    images = Tensor(np.arange(9).reshape(1, 1, 3, 3))
     kernel = Tensor(np.arange(4).reshape(2, 2, 1, 1))
     np.testing.assert_allclose(
             images.convolve(kernel).val[0,:,:,0],
             np.array([[19, 25], [37, 43]]))
 
-    x0 = Tensor(np.arange(9).reshape(9,1))
-    jacobian_test(x0, lambda x: x.T.reshape(-1, 3, 3, 1).convolve(kernel).reshape(-1, 4).T)
+    x0 = Tensor(np.arange(9).reshape(9, 1))
+    jacobian_test(x0, lambda x: x.T.reshape(-1, 1, 3, 3).convolve(kernel).reshape(-1, 4).T)
     kernel2 = Tensor(np.arange(8).reshape(2, 2, 1, 2))
-    jacobian_test(x0, lambda x: x.T.reshape(-1, 3, 3, 1).convolve(kernel2).reshape(-1, 8).T)
+    jacobian_test(x0, lambda x: x.T.reshape(-1, 1, 3, 3).convolve(kernel2).reshape(-1, 8).T)
 
 def test_mul():
     np.random.seed(0)
@@ -226,11 +224,11 @@ def jacobian_test(x0, f, eps=1e-4):
 def test_softmax():
     np.random.seed(0)
     #x = np.random.randn(4,1)
-    x = np.arange(4)[:, None]
+    x = np.arange(4).reshape(4,1)
     x0 = Tensor(x)
     x1 = Tensor(x)
-    y0 = x0.softmax()
-    y1 = x1.softmax2()
+    y0 = x0.softmax(axis=0)
+    y1 = x1.softmax2(axis=0)
     np.testing.assert_allclose(y0.val, y1.val, rtol=1e-4, atol=1e-6)
     y0.sum(axis=0).backward()
     y1.sum(axis=0).backward()
@@ -253,13 +251,13 @@ def test_sum():
     jacobian_test(x0, lambda x: x / x.sum(axis=0))
 
 def test_jacobians():
-    x0 = Tensor(np.arange(1, 5, dtype=float)[:, None])
+    x0 = Tensor(np.arange(1, 5, dtype=float).reshape(4, 1))
     jacobian_test(x0, lambda x: x.relu())
     jacobian_test(x0, lambda x: x.abs())
     jacobian_test(x0, lambda x: x.pow(2))
     jacobian_test(x0, lambda x: x.pow(-1))
-    jacobian_test(x0, lambda x: x.softmax())
-    jacobian_test(x0, lambda x: x.softmax2())
+    jacobian_test(x0, lambda x: x.softmax(axis=0))
+    jacobian_test(x0, lambda x: x.softmax2(axis=0))
     x1 = Tensor(np.abs(np.random.randn(4,1)))
     jacobian_test(x1, lambda x: x.log())
     #jacobian_test(x1, lambda x: x.reshape(1,log())
@@ -286,11 +284,11 @@ def test_logsumexp():
 def test_label_cross_entropy():
     np.random.seed(0)
     d0, d1, b = 4, 4, 1
-    x = np.random.randn(d0, b)
+    x = np.random.randn(b, d0)
     x0 = Tensor(x)
     x1 = Tensor(x)
     labels = np.random.randint(d1, size=(b,))
-    c0 = x0.pow(2).softmax().label_cross_entropy(labels)
+    c0 = x0.pow(2).softmax(axis=1).label_cross_entropy(labels)
     c1 = x1.pow(2).label_cross_entropy_on_logits(labels)
     np.testing.assert_allclose(c0.val, c1.val)
     c0.backward()
@@ -311,7 +309,7 @@ class Linear:
 class Convolution:
     def __init__(self, h, w, c1, c2):
         self.K = Tensor(np.random.randn(h, w, c1, c2) / (w * h * c1 + c2)**.5)
-        self.B = Tensor(np.random.randn(1, 1, 1, c2) / (c2 + 1)**.5)
+        self.B = Tensor(np.random.randn(1, c2, 1, 1) / (c2 + 1)**.5)
 
     def __call__(self, x):
         return x.convolve(self.K) + self.B
@@ -332,27 +330,32 @@ class Sequential:
         return [param for layer in self.layers for param in layer.parameters()]
 
 class ReLU:
-    def __call__(self, x):
-        return x.relu()
-
-    def parameters(self):
-        return []
+    def __call__(self, x): return x.relu()
+    def parameters(self): return []
 
 class Reshape:
-    def __init__(self, *shape):
-        self.shape = shape
+    def __init__(self, *shape): self.shape = shape
+    def __call__(self, x): return x.reshape(*self.shape)
+    def parameters(self): return []
 
-    def __call__(self, x):
-        return x.reshape(*self.shape)
-
-    def parameters(self):
-        return []
+from sklearn import datasets, utils, preprocessing
+from sklearn.model_selection import train_test_split
+import time
+def get_mnist(full=False):
+    if not full:
+        X, y = datasets.load_digits(return_X_y=True)
+        size = 8
+    else:
+        print('Downloading mnist...')
+        X, y = datasets.fetch_openml('mnist_784', version=1, return_X_y=True, parser='auto')
+        print('Done.')
+        X, y = X.to_numpy(), y.astype(int).to_numpy()
+        size = 28
+    return X.reshape(-1, 1, size, size), y, size
 
 def mnist():
-    from sklearn import datasets, utils, preprocessing
-    from sklearn.model_selection import train_test_split
-    X, y = datasets.load_digits(return_X_y=True)
-    X = X.reshape(-1, 8, 8, 1)
+    X, y, size = get_mnist(full=False)
+    X = X.reshape(-1, 1, size, size)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     batch_size = 32
@@ -361,33 +364,32 @@ def mnist():
         for i in range(0, len(X), batch_size):
             yield Tensor(X[i:i+batch_size]), y[i:i+batch_size]
 
+    ch = 8
     net = Sequential(
-            Convolution(2, 2, 1, 8), # Image down to (7, 7)
-            ReLU(),
-            Convolution(2, 2, 8, 11), # Image down to (6, 6)
-            ReLU(),
-            Convolution(2, 2, 11, 16), # Image down to (5, 5)
-            ReLU(),
-            Convolution(2, 2, 16, 25), # Image down to (4, 4)
-            ReLU(),
-            Reshape(-1, 4 * 4 * 25),
-            Linear(4 * 4 * 25, 10),
+            Convolution(2, 2, 1, ch), ReLU(),
+            Convolution(2, 2, ch, ch), ReLU(),
+            Reshape(-1, (size-2)**2 * ch),
+            Linear((size-2)**2*ch, 10),
         )
 
     def step(pb, epoch):
         total_loss, correct = 0, 0
-        for X_batch, y_batch in batches(X_train, y_train):
+        for X_batch, y_batch in tqdm.tqdm(batches(X_train, y_train), leave=False):
+            #start = time.time()
             out = net(X_batch)
+            #print('Forward:', time.time() - start)
             # Compute loss
             #loss = out.label_cross_entropy_on_logits(y_batch)
-            #loss = -(out / out.norm(axis=1)).select(y_batch).sum(axis=0)
-            loss = (-Tensor(2)*out.select(y_batch) + out.pow(2).sum(axis=1)).sum(axis=0)
+            loss = -(out / out.norm(axis=1)).select(y_batch).sum(axis=0)
+            #loss = (-Tensor(2)*out.select(y_batch) + out.pow(2).sum(axis=1)).sum(axis=0)
             # Measure accuracy
             total_loss += loss.val
             #print(out.val.shape, out.val.arg y_batch)
             correct += (out.val.argmax(axis=1) == y_batch).sum()
             # Backprop
+            #start = time.time()
             loss.backward()
+            #print('Backwards:', time.time() - start)
             # Gradient descent
             #lr = 1e-2 if epoch < 100 else 1e-3
             lr = 1e-2
